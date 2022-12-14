@@ -1,0 +1,924 @@
+---
+title: "Assignment 1 - Language development in autistic and neurotypical children"
+output: html_document
+group members: "Victoria Engberg Lowe, Vlada Caraman, Natasha Becker Bertelsen" 
+date: "12/10-2022"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Assignment 1  - Language development in autistic and neurotypical children
+
+```{r Load packages}
+pacman::p_load(tidyverse, 
+       glue,
+       data.table,
+       dplyr,
+       moments,
+       tidybayes,
+       ggplot2,
+       ggridges,
+       plyr,
+       ellipse,
+       brms,
+       cowplot,
+       viridis,
+       gridExtra,
+       tidyr,
+       loo)
+```
+
+```{r Simulate data}
+set.seed(1000)
+
+# Defining variables 
+n <- 30
+visits <- 6
+mu_asd <- log(1.5)
+sigma_asd <- log(1.5)-log(1.5-0.5)
+mu_td <- log(1.5)
+sigma_td <- log(1.5)-log(1.5-0.3)
+mu_visit_asd <- 0.1
+sigma_visit_asd <- 0.03 
+mu_visit_td <- 0.2
+sigma_visit_td <- 0.017
+error <- 0.1 
+
+d <- tibble(expand.grid(ID = seq(n), Diagnosis = c("ASD", "TD"), Visit = seq(visits)))
+
+#changing id (so that every id has diff diagnosis)
+d <- d %>% 
+mutate(ID=ifelse(Diagnosis =="ASD", ID+(n*2), ID))
+
+#generate individual intercept (MLU at v1) and idv slope (change by visit)
+d <- d %>% mutate(
+  IndividualIntercept = NA,
+  IndividualSlope = NA
+)
+
+for (i in seq(d$ID)) {
+  d$IndividualIntercept[d$ID == i & d$Diagnosis == "ASD"] <- rnorm(1, mu_asd, sigma_asd)
+  d$IndividualIntercept[d$ID == i & d$Diagnosis == "TD"] <- rnorm(1, mu_td, sigma_td)
+   d$IndividualSlope[d$ID == i & d$Diagnosis == "ASD"] <- rnorm(1, mu_visit_asd, sigma_visit_asd)
+     d$IndividualSlope[d$ID == i & d$Diagnosis == "TD"] <- rnorm(1, mu_visit_td, sigma_visit_td)
+}
+
+#calculate mlu per each datapoint
+for (i in seq(nrow(d))) {
+  d$MLU[i] <- exp(rnorm(1,(d$IndividualIntercept[i]+
+                          d$IndividualSlope[i]
+                           *(d$Visit[i]-1)),
+                        error))
+}
+
+#checking data
+glimpse(d)
+
+ggplot(d, aes(Visit, MLU, color = Diagnosis, group = ID)) +
+  theme_bw()+
+  geom_point()+
+  geom_line(alpha=0.3)
+
+```
+
+```{r Define formula}
+
+MLU_f1 <- bf(MLU ~ 0 + Diagnosis + Diagnosis:Visit + (1 + Visit|ID)) 
+
+get_prior(MLU_f1, d, family = "lognormal")
+
+```
+
+```{r Define the prior}
+# Define the prior 
+MLU_p1 <- c(
+  prior(normal(0, 0.2), class = b), 
+  prior(normal(0.4, 0.1), class = b, coef = "DiagnosisASD"), 
+  prior(normal(0.4, 0.1), class = b, coef = "DiagnosisTD"), 
+  prior(normal(0, 0.1), class = sd, coef = Intercept, group = ID),
+  prior(normal(0, 0.05), class = sd, coef = Visit, group = ID),
+  prior(lkj(3), class = "cor")
+)
+
+```
+
+```{r Prior predictive checks}
+MLU_m1_prior <- brm(
+  MLU_f1,
+  data = d,
+  family = lognormal,
+  prior = MLU_p1,
+  sample_prior = "only",
+  chains = 2,
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+    
+    
+  )
+)
+
+pp_check(MLU_m1_prior, ndraws = 100) +
+  labs(title = "Prior-predictive check for Model 1")
+
+```
+
+```{r Fit the model and prior-posterior checks}
+MLU_m1_posterior <- brm(
+    MLU_f1,
+    data = d,
+    family = lognormal,
+    prior = MLU_p1,
+    sample_prior = T,
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    )
+  )
+
+```
+
+```{r  Model quality checks}
+# Posterior predictive checks
+pp_check(MLU_m1_posterior, ndraws = 100) +
+  labs(title = "Posterior-predictive check Model 1")
+
+plot(conditional_effects(MLU_m1_posterior))
+
+# Prior-posterior update checks
+posterior_m1 <- as_draws_df(MLU_m1_posterior)
+
+# Intercept ASD update check
+Intercept_ASD <- ggplot(posterior_m1) +
+  geom_density(aes(prior_b_DiagnosisASD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisASD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept ASD') +
+  theme_classic()
+
+# Intercept TD update check
+Intercept_TD <- ggplot(posterior_m1) +
+  geom_density(aes(prior_b_DiagnosisTD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisTD), fill = "#FC4E07", 
+               color = "black", alpha = 0.6) +
+  xlab('Intercept TD') +
+  theme_classic()
+
+# Slope ASD update check
+Slope_ASD <- ggplot(posterior_m1) +
+  geom_density(aes(`prior_b_DiagnosisASD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisASD:Visit`), fill = "#FC4E07", 
+               color = "black", alpha = 0.6) +
+  xlab('Slope ASD') +
+  theme_classic()
+
+# Slope TD update check
+Slope_TD <- ggplot(posterior_m1) +
+  geom_density(aes(`prior_b_DiagnosisTD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisTD:Visit`), fill = "#FC4E07", 
+               color = "black", alpha = 0.6) +
+  xlab('Slope TD') +
+  theme_classic()
+
+# Overall standard deviation for ID (population level)
+posterior_m1$prior_sd_ID__Intercept
+
+SD_ID <- ggplot(posterior_m1) +
+  geom_density(aes(prior_sd_ID__Intercept), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Intercept), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('SD ID') +
+  theme_classic()
+
+# Overall standard deviation for Visit (population level)
+SD_Visit <- ggplot(posterior_m1) +
+  geom_density(aes(prior_sd_ID__Visit), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Visit), fill = "#FC4E07", 
+               color = "black", alpha = 0.6) +
+  xlab('SD Visit') +
+  theme_classic()
+
+# Correlation between intercept and visit 
+Cor <- ggplot(posterior_m1) +
+  geom_density(aes(prior_cor_ID, fill = "steelblue",
+                   color = "black", alpha = 0.6)) +
+  geom_density(aes(cor_ID__Intercept__Visit), fill = "#FC4E07", 
+               color = "black", alpha = 0.6) +
+  xlab('Correlation ID and Visit') +
+  theme_classic()
+
+# Sigma
+sigma <- ggplot(posterior_m1) +
+  geom_density(aes(prior_sigma), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sigma), fill = "#FC4E07", 
+               color = "black", alpha = 0.6) +
+  xlab('Sigma') +
+  theme_classic()
+
+grid.arrange(Intercept_ASD, Intercept_TD, SD_ID, Slope_ASD, Slope_TD, SD_Visit, sigma, Cor, nrow = 4)
+
+# Prior-posterior update check on the intercepts
+p1 <- ggplot(posterior_m1) +
+  geom_histogram(aes(prior_b_DiagnosisASD),
+                 fill = "red", color = "red", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(b_DiagnosisASD),
+                 fill = "green", color = "green", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(b_DiagnosisTD),
+                 fill = "blue", color = "blue", alpha = 0.3, bins = 50) +
+  theme_bw() +
+  xlab("Prior-posterior update check on the intercepts")
+
+# Prior-posterior update check on the variability of the intercept
+p2 <- ggplot(posterior_m1) + 
+  geom_histogram(aes(prior_sd_ID__Intercept),
+                 fill = "red", color = "red", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(sd_ID__Intercept),
+                 fill = "green", color = "green", alpha = 0.3, bins = 50) +
+  theme_bw() + 
+  xlab("Prior-posterior update check on the variability of the intercept")
+
+# Prior-posterior update check on slope 
+p3 <- ggplot(posterior_m1) +
+  geom_histogram(aes(`prior_b_DiagnosisASD:Visit`),
+                 fill = "red", color = "red", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(`b_DiagnosisASD:Visit`),
+                 fill = "green", color = "green", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(`b_DiagnosisTD:Visit`),
+                 fill = "blue", color = "blue", alpha = 0.3, bins = 50) +
+  theme_bw() +
+  xlab("Prior-posterior update check on the slopes")
+
+# Prior-posterior update check on the variability of the slope
+p4 <- ggplot(posterior_m1) + 
+  geom_histogram(aes(prior_sd_ID__Visit),
+                 fill = "red", color = "red", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(sd_ID__Visit),
+                 fill = "green", color = "green", alpha = 0.3, bins = 50) +
+  theme_bw() + 
+  xlab("Prior-posterior update check on the variability of the slope")
+
+# Prior-posterior update check on the correlation
+p5 <- ggplot(posterior_m1) + 
+  geom_histogram(aes(prior_cor_ID),
+                 fill = "red", color = "red", alpha = 0.3, bins = 50) +
+  geom_histogram(aes(cor_ID__Intercept__Visit),
+                 fill = "green", color = "green", alpha = 0.3, bins = 50) +
+  theme_bw() + 
+  xlab("Prior-posterior update check on the correlation")
+
+grid.arrange(p1,p2,p3,p4,p5)
+
+```
+
+```{r Model quality checks}
+# Rhat and Effective samples 
+summary(MLU_m1_posterior)
+
+# The Rhat values provide information about the convergence of the algorithm. Rhat values close to 1 suggest that the model has converged. In this case, the  Rhat values are close to 1, and therefore the model has converged. 
+
+# The Bulk_ESS and Tail_ESS (effective sample size (ESS)) capture the sampling efficiency in the bulk and tails of the distribution. 
+
+```
+Once the pipeline is in place, loop through different sample sizes to assess how much data you would need to collect. N.B. for inspiration on how to set this up, check the tutorials by Kurz that are linked in the syllabus.
+```{r Power Analysis}
+fit <- brm(
+    MLU_f1,
+    data = d,
+    family = lognormal,
+    prior = MLU_p1,
+    sample_prior = T,
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    ),
+    seed = 1
+  )
+
+# Creating a function for the simulation
+sim_d_and_fit <- function(seed, n){
+  
+  set.seed(seed)
+  
+  visits <- 6
+  mu_asd <- log(1.5)
+  sigma_asd <- log(1.5)-log(1.5-0.5)
+  mu_td <- log(1.5)
+  sigma_td <- log(1.5)-log(1.5-0.3)
+  mu_visit_asd <- 0.1
+  sigma_visit_asd <- 0.03 
+  mu_visit_td <- 0.2
+  sigma_visit_td <- 0.017
+  error <- 0.1 
+
+  d <- 
+    tibble(expand.grid(ID = seq(n), Diagnosis = c("ASD", "TD"), Visit = seq(visits))) %>% 
+    mutate(IndividualIntercept = NA,
+           IndividualSlope = NA)
+  
+  d <- d %>% 
+    mutate(ID=ifelse(Diagnosis =="ASD", ID+(n*2), ID))
+
+  for (i in seq(d$ID)) {
+    d$IndividualIntercept[d$ID == i & d$Diagnosis == "ASD"] <- rnorm(1, mu_asd, sigma_asd)
+    d$IndividualIntercept[d$ID == i & d$Diagnosis == "TD"] <- rnorm(1, mu_td, sigma_td)
+    d$IndividualSlope[d$ID == i & d$Diagnosis == "ASD"] <- rnorm(1, mu_visit_asd, sigma_visit_asd)
+    d$IndividualSlope[d$ID == i & d$Diagnosis == "TD"] <- rnorm(1, mu_visit_td, sigma_visit_td)
+}
+
+  for (i in seq(nrow(d))) {
+    d$MLU[i] <- exp(rnorm(1,(d$IndividualIntercept[i]+
+                               d$IndividualSlope[i]*(d$Visit[i]-1)),error))
+  }
+}
+
+# Producing one simulation
+test <- sim_d_and_fit(100,30)
+
+# Iterating simulation 100 times 
+n_sim <- 100
+
+t1 <- Sys.time() # tracking the time
+
+s <- #large nested df
+  tibble(seed = 1:n_sim) %>% 
+  mutate(d = purrr::map(seed, sim_d_and_fit, n = 30)) %>% 
+  mutate(fit = purrr::map2(d, seed, ~update(fit, newdata = .x, seed = .y)))
+
+t2 <- Sys.time()
+t2-t1
+head(s)
+```
+
+```{r}
+# POWER ANALYSIS 3 TRY
+steszt <- s %>% 
+ mutate("betas" = purrr::map(fit, ~ as_draws_df(.) %>%  
+                        data.frame() %>%  
+                        tibble::rownames_to_column("parameters"))) %>% 
+select(-d,-fit) %>% 
+unnest("betas") %>%  
+select(seed, b_DiagnosisASD.Visit, b_DiagnosisTD.Visit)
+
+# SLOPE POSTERIORS
+lab_colors <- c("TD" = "blue", "ASD" = "red") 
+steszt2<-steszt %>% 
+  dplyr::group_by(seed) %>% 
+  dplyr::summarise(mean(b_DiagnosisASD.Visit),
+            min(b_DiagnosisASD.Visit),
+            max(b_DiagnosisASD.Visit),
+            mean(b_DiagnosisTD.Visit),
+            min(b_DiagnosisTD.Visit),
+            max(b_DiagnosisTD.Visit)) %>% 
+
+  mutate(power = ifelse( `min(b_DiagnosisTD.Visit)`- `max(b_DiagnosisASD.Visit)` > 0,1,0)) 
+
+steszt2 %>% 
+  ggplot(aes(x=seed)) +
+  geom_pointrange(fatten = 1/2,aes(y = `mean(b_DiagnosisASD.Visit)`, ymin = `min(b_DiagnosisASD.Visit)`, ymax = `max(b_DiagnosisASD.Visit)`, color = "ASD"))+
+  geom_pointrange(fatten = 1/2, aes(y = `mean(b_DiagnosisTD.Visit)`, ymin = `min(b_DiagnosisTD.Visit)`, ymax = `max(b_DiagnosisTD.Visit)`, color = "TD"))+
+  labs(x = "seed (i.e., simulation index)",
+       y = " ",
+       color = "Legend",
+       subtitle = stringr::str_glue("30 participants from each group, power = {mean(steszt2$power)}"))+
+  scale_color_manual(values = lab_colors)
+
+```
+
+# Part 2 - Strong in the Bayesian ken, you are now ready to analyse the actual data
+```{r}
+# Loading in the real data
+df <- read_csv("clinical_data.csv")
+
+# Modifying the dataframe
+df <- df %>% 
+  dplyr::rename(MLU = Child_Mlu)
+
+# Describing the sample
+## Overview of columns and variable type
+glimpse(df)
+
+## Calculating means, min and max
+### age
+df %>% 
+  dplyr::group_by(Visit) %>% 
+  dplyr::summarize(Mean_age = mean(Age, na.rm = T))
+
+### The number of female participants (55 in visit 1)
+df %>% 
+  dplyr::group_by(Visit) %>%   
+  dplyr::filter(Gender == "Female") %>% 
+  dplyr::summarize(n())
+
+### The number of male participants (11 in visit 1)
+df %>% 
+  dplyr::group_by(Visit) %>%   
+  dplyr::filter(Gender == "Male") %>% 
+  dplyr::summarize(n())
+
+### cognitive abilities
+df %>% 
+  dplyr::group_by(Diagnosis) %>% 
+  dplyr::summarize(mean_non_verb = mean(Non_verbal_iq_1, na.rm = T),
+                   mean_verb = mean(Verbal_iq_1, na.rm = T),
+                   mean_soc = mean(Socialization_1, na.rm = T))
+```
+```{r Apply model to empirical data}
+# Applying our model to empirical data
+df_model_1 <- brm(
+    MLU_f1,
+    data = df,
+    prior = MLU_p1,
+    #family = lognormal,
+    sample_prior = T,
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    )
+  )
+
+pp_check(df_model_1, ndraws = 100) + 
+  labs(title = "Posterior-update check with real data")
+
+plot(conditional_effects(df_model_1))
+
+ggplot(df, aes(Visit, MLU, color = Diagnosis, group = ID)) +
+  theme_bw()+
+  geom_point()+
+  geom_line(alpha=0.3)
+
+summary(df_model_1)
+```
+
+```{r Model comparison}
+set.seed(800)
+# Scaling the predictors
+df <- df %>% mutate_at(c("Mom_mlu",
+                         "Verbal_iq_1",
+                         "Socialization_1"), ~(scale(.) %>% as.vector))
+
+# Defining new models 
+MLU_f2 <- bf(MLU ~ 0 + Diagnosis + Diagnosis:Visit + Diagnosis:Mom_mlu + (1 + Visit|ID)) 
+MLU_f3 <- bf(MLU ~ 0 + Diagnosis + Diagnosis:Visit + Diagnosis:Verbal_iq_1 + (1 + Visit|ID)) 
+MLU_f4 <- bf(MLU ~ 0 + Diagnosis + Diagnosis:Visit + Diagnosis:Socialization_1 + (1 + Visit|ID))
+
+# Set priors 
+MLU_p2 <- c(
+  prior(normal(0, 0.2), class = b), 
+  prior(normal(0.4, 0.1), class = b, coef = "DiagnosisASD"), 
+  prior(normal(0.4, 0.1), class = b, coef = "DiagnosisTD"), 
+  prior(normal(0, 0.1), class = sd, coef = Intercept, group = ID),
+  prior(normal(0, 0.05), class = sd, coef = Visit, group = ID),
+  prior(lkj(3), class = "cor")
+)
+
+# Prior-predictive check model 2
+df_model_2 <- brm(
+    MLU_f2,
+    data = df,
+    prior = MLU_p2,
+    sample_prior = "only",
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    )
+  )
+
+m2 <- pp_check(df_model_2, ndraws = 100) + 
+  labs(title = "Prior-predictive check model 2")
+
+# Prior-predictive check model 3
+df_model_3 <- brm(
+    MLU_f3,
+    data = df,
+    prior = MLU_p2,
+    sample_prior = "only",
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    )
+  )
+
+m3 <- pp_check(df_model_3, ndraws = 100) + 
+  labs(title = "Prior-predictive check model 3")
+
+# Prior-predictive check model 4
+df_model_4 <- brm(
+    MLU_f4,
+    data = df,
+    prior = MLU_p2,
+    sample_prior = "only",
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    )
+  )
+
+m4 <- pp_check(df_model_4, ndraws = 100) + 
+  labs(title = "Prior-predictive check model 4")
+
+grid.arrange(m2,m3,m4)
+
+# Posterior-predictive check model 2
+df_post_2 <- brm(
+    MLU_f2,
+    data = df,
+    prior = MLU_p2,
+    sample_prior = T,
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    )
+  )
+
+mpost2 <- pp_check(df_post_2, ndraws = 100) + 
+  labs(title = "Posterior-predictive check model 2")
+
+# Prior-predictive check model 3
+df_post_3 <- brm(
+    MLU_f3,
+    data = df,
+    prior = MLU_p2,
+    sample_prior = T,
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    )
+  )
+
+mpost3 <- pp_check(df_post_3, ndraws = 100) + 
+  labs(title = "Posterior-predictive check model 3")
+
+# Prior-predictive check model 4
+df_post_4 <- brm(
+    MLU_f4,
+    data = df,
+    prior = MLU_p2,
+    sample_prior = T,
+    cores = 2, 
+    chains = 2, 
+    backend = "cmdstanr",
+    threads = threading(2),
+    control = list(
+      adapt_delta = 0.99,
+      max_treedepth = 20
+    )
+  )
+
+mpost4 <- pp_check(df_post_4, ndraws = 100) + 
+  labs(title = "Posterior-predictive check model 4")
+
+grid.arrange(mpost2,mpost3,mpost4)
+
+```
+
+```{r Posterior predictive update checks model 2}
+# Prior-posterior update checks
+posterior_m2 <- as_draws_df(df_post_2)
+variables(posterior_m2)
+
+# Intercept ASD update check
+Intercept_ASD2 <- ggplot(posterior_m2) +
+  geom_density(aes(prior_b_DiagnosisASD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisASD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept ASD') +
+  theme_classic() +
+  labs(title = "Intercept ASD")
+
+# Intercept TD update check
+Intercept_TD2 <- ggplot(posterior_m2) +
+  geom_density(aes(prior_b_DiagnosisTD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisTD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept TD') +
+  theme_classic() +
+  labs(title = "Intercept TD")
+
+# Slope ASD visit update check
+Slope_ASD2a <- ggplot(posterior_m2) +
+  geom_density(aes(`prior_b_DiagnosisASD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisASD:Visit`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Visit ASD') +
+  theme_classic() +
+  labs(title = "Slope Visit ASD")
+
+# Slope TD visit update check
+Slope_TD2a <- ggplot(posterior_m2) +
+  geom_density(aes(`prior_b_DiagnosisTD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisTD:Visit`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Visit TD') +
+  theme_classic() +
+  labs(title = "Slope Visit TD")
+
+# Slope ASD mom_mlu update check
+Slope_ASD2b <- ggplot(posterior_m2) +
+  geom_density(aes(`prior_b_DiagnosisASD:Mom_mlu`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisASD:Mom_mlu`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Mom_mlu ASD') +
+  theme_classic() +
+  labs(title = "Slope Mom_mlu ASD")
+
+# Slope TD mom_mlu update check
+Slope_TD2b <- ggplot(posterior_m2) +
+  geom_density(aes(`prior_b_DiagnosisTD:Mom_mlu`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisTD:Mom_mlu`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Mom_mlu TD') +
+  theme_classic() +
+  labs(title = "Slope Mom_mlu TD")
+
+# SD intercept update check
+SD_intercept2 <- ggplot(posterior_m2) +
+  geom_density(aes(prior_sd_ID__Intercept), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Intercept), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("SD intercept") +
+  theme_classic() +
+  labs(title = "SD intercept")
+
+# SD visit update check
+SD_visit2 <- ggplot(posterior_m2) +
+  geom_density(aes(prior_sd_ID__Visit), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Visit), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("SD visit") +
+  theme_classic() +
+  labs(title = "SD visit")
+
+# sigmaupdate check
+Sigma2 <- ggplot(posterior_m2) +
+  geom_density(aes(sigma), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sigma), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("Sigma") +
+  theme_classic() +
+  labs(title = "Sigma")
+
+grid.arrange(Intercept_ASD2, Intercept_TD2, Slope_ASD2a, Slope_TD2a, Slope_ASD2b, Slope_TD2b, SD_intercept2, SD_visit2, Sigma2, ncol = 4)
+
+```
+```{r Posterior predictive update checks model 3}
+# Prior-posterior update checks
+posterior_m3 <- as_draws_df(df_post_3)
+variables(posterior_m3)
+
+# Intercept ASD update check
+Intercept_ASD3 <- ggplot(posterior_m3) +
+  geom_density(aes(prior_b_DiagnosisASD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisASD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept ASD') +
+  theme_classic() +
+  labs(title = "Intercept ASD")
+
+# Intercept TD update check
+Intercept_TD3 <- ggplot(posterior_m3) +
+  geom_density(aes(prior_b_DiagnosisTD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisTD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept TD') +
+  theme_classic() +
+  labs(title = "Intercept TD")
+
+# Slope ASD visit update check
+Slope_ASD3a <- ggplot(posterior_m3) +
+  geom_density(aes(`prior_b_DiagnosisASD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisASD:Visit`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Visit ASD') +
+  theme_classic() +
+  labs(title = "Slope Visit ASD")
+
+# Slope TD visit update check
+Slope_TD3a <- ggplot(posterior_m3) +
+  geom_density(aes(`prior_b_DiagnosisTD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisTD:Visit`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Visit TD') +
+  theme_classic() +
+  labs(title = "Slope Visit TD")
+
+# Slope ASD Verbal_iq_1 update check
+Slope_ASD3b <- ggplot(posterior_m3) +
+  geom_density(aes(`prior_b_DiagnosisASD:Verbal_iq_1`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisASD:Verbal_iq_1`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Verbal_iq_1 ASD') +
+  theme_classic() +
+  labs(title = "Slope Verbal_iq_1 ASD")
+
+# Slope TD Verbal_iq_1 update check
+Slope_TD3b <- ggplot(posterior_m3) +
+  geom_density(aes(`prior_b_DiagnosisTD:Verbal_iq_1`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisTD:Verbal_iq_1`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Verbal_iq_1 TD') +
+  theme_classic() +
+  labs(title = "Slope Verbal_iq_1 TD")
+
+# SD intercept update check
+SD_intercept3 <- ggplot(posterior_m3) +
+  geom_density(aes(prior_sd_ID__Intercept), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Intercept), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("SD intercept") +
+  theme_classic() +
+  labs(title = "SD intercept")
+
+# SD visit update check
+SD_visit3 <- ggplot(posterior_m3) +
+  geom_density(aes(prior_sd_ID__Visit), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Visit), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("SD visit") +
+  theme_classic() +
+  labs(title = "SD visit")
+
+# sigmaupdate check
+Sigma3 <- ggplot(posterior_m3) +
+  geom_density(aes(sigma), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sigma), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("Sigma") +
+  theme_classic() +
+  labs(title = "Sigma")
+
+grid.arrange(Intercept_ASD3, Intercept_TD3, Slope_ASD3a, Slope_TD3a, Slope_ASD3b, Slope_TD3b, SD_intercept3, SD_visit3, Sigma3, ncol = 4)
+```
+
+```{r Posterior predictive update checks model 4}
+# Prior-posterior update checks
+posterior_m4 <- as_draws_df(df_post_4)
+variables(posterior_m4)
+
+# Intercept ASD update check
+Intercept_ASD4 <- ggplot(posterior_m4) +
+  geom_density(aes(prior_b_DiagnosisASD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisASD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept ASD') +
+  theme_classic() +
+  labs(title = "Intercept ASD")
+
+# Intercept TD update check
+Intercept_TD4 <- ggplot(posterior_m4) +
+  geom_density(aes(prior_b_DiagnosisTD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisTD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept TD') +
+  theme_classic() +
+  labs(title = "Intercept TD")
+
+# Slope ASD visit update check
+Slope_ASD4a <- ggplot(posterior_m4) +
+  geom_density(aes(`prior_b_DiagnosisASD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisASD:Visit`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Visit ASD') +
+  theme_classic() +
+  labs(title = "Slope Visit ASD")
+
+# Slope TD visit update check
+Slope_TD4a <- ggplot(posterior_m4) +
+  geom_density(aes(`prior_b_DiagnosisTD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisTD:Visit`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Visit TD') +
+  theme_classic() +
+  labs(title = "Slope Visit TD")
+
+# Slope ASD Socialization update check
+Slope_ASD4b <- ggplot(posterior_m4) +
+  geom_density(aes(`prior_b_DiagnosisASD:Socialization_1`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisASD:Socialization_1`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Socialization ASD') +
+  theme_classic() +
+  labs(title = "Slope Socialization ASD")
+
+# Slope TD Socialization update check
+Slope_TD4b <- ggplot(posterior_m4) +
+  geom_density(aes(`prior_b_DiagnosisTD:Socialization_1`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisTD:Socialization_1`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope Socialization TD') +
+  theme_classic() +
+  labs(title = "Slope Socialization TD")
+
+# SD intercept update check
+SD_intercept4 <- ggplot(posterior_m4) +
+  geom_density(aes(prior_sd_ID__Intercept), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Intercept), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("SD intercept") +
+  theme_classic() +
+  labs(title = "SD intercept")
+
+# SD visit update check
+SD_visit4 <- ggplot(posterior_m4) +
+  geom_density(aes(prior_sd_ID__Visit), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Visit), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("SD visit") +
+  theme_classic() +
+  labs(title = "SD visit")
+
+# sigmaupdate check
+Sigma4 <- ggplot(posterior_m4) +
+  geom_density(aes(sigma), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sigma), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab("Sigma") +
+  theme_classic() +
+  labs(title = "Sigma")
+
+grid.arrange(Intercept_ASD4, Intercept_TD4, Slope_ASD4a, Slope_TD4a, Slope_ASD4b, Slope_TD4b, SD_intercept4, SD_visit4, Sigma4, ncol = 4)
+````
+
+```{r Model comparison with Looic}
+MLU_m1_posterior <- add_criterion(MLU_m1_posterior, criterion = "loo") #not included in model comparison
+df_post_2 <- add_criterion(df_post_2, criterion = "loo")
+df_post_3 <- add_criterion(df_post_3, criterion = "loo")
+df_post_4 <- add_criterion(df_post_4, criterion = "loo")
+
+loo_compare(df_post_2, df_post_3, df_post_4)
+
+```
+
+
+
+
