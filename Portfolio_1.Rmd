@@ -442,9 +442,10 @@ df %>%
                    mean_verb = mean(Verbal_iq_1, na.rm = T),
                    mean_soc = mean(Socialization_1, na.rm = T))
 ```
+
 ```{r Apply model to empirical data}
 # Applying our model to empirical data
-df_model_1 <- brm(
+df_post_1 <- brm(
     MLU_f1,
     data = df,
     prior = MLU_p1,
@@ -460,17 +461,94 @@ df_model_1 <- brm(
     )
   )
 
-pp_check(df_model_1, ndraws = 100) + 
-  labs(title = "Posterior-update check with real data")
+pp_check(df_post_1, ndraws = 100) + 
+  labs(title = "Posterior-predictive check with real data")
 
-plot(conditional_effects(df_model_1))
+plot(conditional_effects(df_post_1))
 
 ggplot(df, aes(Visit, MLU, color = Diagnosis, group = ID)) +
   theme_bw()+
   geom_point()+
   geom_line(alpha=0.3)
 
-summary(df_model_1)
+summary(df_post_1)
+
+# Prior-predictive update checks
+posterior_emp_m1 <- as_draws_df(df_post_1)
+variables(posterior_emp_m1)
+
+## Intercept ASD update check
+Intercept_emp_ASD <- ggplot(posterior_emp_m1) +
+  geom_density(aes(prior_b_DiagnosisASD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisASD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept ASD') +
+  theme_classic() +
+  labs(title = "Intercept ASD empirical")
+
+## Intercept TD update check
+Intercept_emp_TD <- ggplot(posterior_emp_m1) +
+  geom_density(aes(prior_b_DiagnosisTD), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(b_DiagnosisTD), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Intercept TD') +
+  theme_classic() +
+  labs(title = "Intercept TD empirical")
+
+# Slope ASD empirical
+Slope_emp_ASD <- ggplot(posterior_emp_m1) +
+  geom_density(aes(`prior_b_DiagnosisASD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisASD:Visit`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope ASD') +
+  theme_classic() +
+  labs(title = "Slope ASD empirical") 
+
+# Slope TD empirical
+Slope_emp_TD <- ggplot(posterior_emp_m1) +
+  geom_density(aes(`prior_b_DiagnosisTD:Visit`), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(`b_DiagnosisTD:Visit`), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Slope TD') +
+  theme_classic() +
+  labs(title = "Slope TD empirical")
+
+# Standard deviation intercept
+sd_emp_intercept <- ggplot(posterior_emp_m1) +
+  geom_density(aes(prior_sd_ID__Intercept), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Intercept), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('SD intercept') +
+  theme_classic() +
+  labs(title = "SD intercept empirical")
+
+# Standard deviation slope
+sd_emp_slope <- ggplot(posterior_emp_m1) +
+  geom_density(aes(prior_sd_ID__Visit), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sd_ID__Visit), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('SD slope') +
+  theme_classic() +
+  labs(title = "SD slope empirical")
+
+# Sigma
+sigma_emp <- ggplot(posterior_emp_m1) +
+  geom_density(aes(prior_sigma), fill = "steelblue",
+               color = "black", alpha = 0.6) +
+  geom_density(aes(sigma), fill = "#FC4E07",
+               color = "black", alpha = 0.6) +
+  xlab('Sigma') +
+  theme_classic() +
+  labs(title = "SD slope empirical")
+
+grid.arrange(Intercept_emp_ASD, Intercept_emp_TD, Slope_emp_ASD, Slope_emp_TD, sd_emp_intercept, sd_emp_slope, sigma_emp)
+
 ```
 
 ```{r Model comparison}
@@ -700,17 +778,7 @@ SD_visit2 <- ggplot(posterior_m2) +
   theme_classic() +
   labs(title = "SD visit")
 
-# sigmaupdate check
-Sigma2 <- ggplot(posterior_m2) +
-  geom_density(aes(sigma), fill = "steelblue",
-               color = "black", alpha = 0.6) +
-  geom_density(aes(sigma), fill = "#FC4E07",
-               color = "black", alpha = 0.6) +
-  xlab("Sigma") +
-  theme_classic() +
-  labs(title = "Sigma")
-
-grid.arrange(Intercept_ASD2, Intercept_TD2, Slope_ASD2a, Slope_TD2a, Slope_ASD2b, Slope_TD2b, SD_intercept2, SD_visit2, Sigma2, ncol = 4)
+grid.arrange(Intercept_ASD2, Intercept_TD2, Slope_ASD2a, Slope_TD2a, Slope_ASD2b, Slope_TD2b, SD_intercept2, SD_visit2, ncol = 4)
 
 ```
 ```{r Posterior predictive update checks model 3}
@@ -798,17 +866,7 @@ SD_visit3 <- ggplot(posterior_m3) +
   theme_classic() +
   labs(title = "SD visit")
 
-# sigmaupdate check
-Sigma3 <- ggplot(posterior_m3) +
-  geom_density(aes(sigma), fill = "steelblue",
-               color = "black", alpha = 0.6) +
-  geom_density(aes(sigma), fill = "#FC4E07",
-               color = "black", alpha = 0.6) +
-  xlab("Sigma") +
-  theme_classic() +
-  labs(title = "Sigma")
-
-grid.arrange(Intercept_ASD3, Intercept_TD3, Slope_ASD3a, Slope_TD3a, Slope_ASD3b, Slope_TD3b, SD_intercept3, SD_visit3, Sigma3, ncol = 4)
+grid.arrange(Intercept_ASD3, Intercept_TD3, Slope_ASD3a, Slope_TD3a, Slope_ASD3b, Slope_TD3b, SD_intercept3, SD_visit3, ncol = 4)
 ```
 
 ```{r Posterior predictive update checks model 4}
@@ -896,26 +954,16 @@ SD_visit4 <- ggplot(posterior_m4) +
   theme_classic() +
   labs(title = "SD visit")
 
-# sigmaupdate check
-Sigma4 <- ggplot(posterior_m4) +
-  geom_density(aes(sigma), fill = "steelblue",
-               color = "black", alpha = 0.6) +
-  geom_density(aes(sigma), fill = "#FC4E07",
-               color = "black", alpha = 0.6) +
-  xlab("Sigma") +
-  theme_classic() +
-  labs(title = "Sigma")
-
-grid.arrange(Intercept_ASD4, Intercept_TD4, Slope_ASD4a, Slope_TD4a, Slope_ASD4b, Slope_TD4b, SD_intercept4, SD_visit4, Sigma4, ncol = 4)
+grid.arrange(Intercept_ASD4, Intercept_TD4, Slope_ASD4a, Slope_TD4a, Slope_ASD4b, Slope_TD4b, SD_intercept4, SD_visit4, ncol = 4)
 ````
 
 ```{r Model comparison with Looic}
-MLU_m1_posterior <- add_criterion(MLU_m1_posterior, criterion = "loo") #not included in model comparison
+df_post_1 <- add_criterion(df_post_1, criterion = "loo") #not included in model comparison
 df_post_2 <- add_criterion(df_post_2, criterion = "loo")
 df_post_3 <- add_criterion(df_post_3, criterion = "loo")
 df_post_4 <- add_criterion(df_post_4, criterion = "loo")
 
-loo_compare(df_post_2, df_post_3, df_post_4)
+loo_compare(df_post_1,df_post_2, df_post_3, df_post_4)
 
 ```
 
