@@ -1,0 +1,299 @@
+---
+title: "Assignment 2 - Meta-analysis of pitch in schizophrenia"
+author: "Natasha Becker Bertelsen"
+date: "24/10/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Load packages}
+pacman::p_load(tidyverse,
+               tidybayes,
+               ggplot2,
+               bayesplot,
+               brms,
+               rstan,
+               msm,
+               readxl,
+               gridExtra,
+               grid,
+               dplyr,
+               metafor)
+
+```
+
+# Assignment 2: Meta-analysis
+
+# Question 1
+
+```{r Simulation}
+set.seed(1000)
+
+# Define parameters
+EffectMean <- 0.4
+StudySD <- 0.4
+Error <- 0.8
+
+# Setup simulation
+Studies <- 100 #number of studies
+
+# Create data frame for all studies
+d <- tibble(
+  Study = seq(Studies),
+  Participants = round(msm::rtnorm(Studies, 20, 10, lower = 10)), #20 is mean, 10 is the sd, and the lower defines the minimum amount of participants)
+  TrueStudyEffect = NA, 
+  ObservedEffect = NA,
+  ObservedSigma = NA,
+  Published = NA, 
+)
+
+# Sample participants and extract mean and publication bias
+for (i in seq(Studies)) {
+  d$TrueStudyEffect[i] <- rnorm(1, EffectMean, StudySD)
+  sampling <- rnorm(d$Participants[i], d$TrueStudyEffect[i], Error)
+  d$ObservedEffect[i] <- mean(sampling)
+  d$ObservedSigma[i]  <- sd(sampling)/sqrt(d$Participants[i]) # calculating the standard error 
+  d$Published[i] <- ifelse( #an ifelse statement checking the probability of the paper getting published  
+    abs(d$ObservedEffect[i]) - (2*d$ObservedSigma[i]) > 0 & d$ObservedEffect[i] > 0, #If the difference between the study's observed effect and two standard errors from the mean is larger than 0 AND the results are positive, then there is a 90% probability that the study gets published. Otherwise, there is a 10% probability that the study will be published 
+    rbinom(1, 1, .9), rbinom(1, 1, 0.1)) 
+}
+
+# Create data frame for only published studies
+d_published <- d %>% 
+  subset(Published == "1")
+
+```
+
+```{r Define Bayesian model}
+
+Pitch_f <- bf(TrueStudyEffect|se(ObservedSigma) ~ 1 + (1|Study))
+
+get_prior(Pitch_f, d, family = "normal")
+```
+
+```{r Set the priors}
+
+Pitch_p <- c(
+  prior(normal(0,0.3), class = Intercept),
+  prior(normal(0,0.3), class = sd)
+)
+
+```
+
+```{r Prior predictive cheks}
+# Prior predictive check for all studies
+Pitch_m_prior <- brm(
+  Pitch_f,
+  data = d, 
+  family = "normal",
+  prior = Pitch_p,
+  sample_prior = "only",
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+all_ppcheck1 <- pp_check(Pitch_m_prior, ndraws = 100) +
+  labs(title = "Prior-predictive check for all studies") # the blue distributions come from the priors, the black distribution is from the data d that we have simulated. We see that the prior distributions and the data distribution are within the same range of values and the range makes sense. The data distribution is a bit skewed to the right but it is acceptable because we don't want the priors to specify it but let the data speak for itself. 
+
+# Prior-predictive check for published studies
+Pitch_Published_m_prior <- brm(
+  Pitch_f,
+  data = d_published, 
+  family = "normal",
+  prior = Pitch_p,
+  sample_prior = "only",
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+published_ppcheck1 <- pp_check(Pitch_Published_m_prior, ndraws = 100) +
+  labs(title = 'Prior-predictive check for published studies') 
+
+grid.arrange(all_ppcheck1,published_ppcheck1, ncol = 2) 
+
+# The range of outcomes have changed since there only the studies with positive outcomes are published (with a few exceptions). 
+```
+
+```{r Posterior predictive check}
+# Posterior predictive check for all studies
+Pitch_m_posterior <- brm(
+  Pitch_f,
+  data = d, 
+  family = "normal",
+  prior = Pitch_p,
+  sample_prior = T,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+all_ppcheck2 <- pp_check(Pitch_m_posterior, ndraws = 100) +
+  labs(title = "Posterior predictive check for all studies")
+
+print(Pitch_m_posterior)
+
+# Posterior predictive check for published studies
+Pitch_Published_m_posterior <- brm(
+  Pitch_f,
+  data = d_published, 
+  family = "normal",
+  prior = Pitch_p,
+  sample_prior = T,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+published_ppcheck2 <- pp_check(Pitch_Published_m_posterior, ndraws = 100) +
+  labs(title = "Posterior-predictive check for published studies") 
+# the posterior distributions are more uniform and we can see that the model has learned from the data because it more clearly resembles the distributions and it is more confident (more pointy).
+
+print(Pitch_Published_m_posterior)
+
+grid.arrange(all_ppcheck2, published_ppcheck2, ncol = 2)
+
+```
+
+    The posterior distributions are much closer to the empirical data. When we take the publication bias into account, we see that the posterior distributions' fit to the empirical data become more noisy since we have fewer data points.  
+
+```{r Prior-posterior update checks}
+# Prior-posterior update check for all studies
+variables(Pitch_m_posterior)
+posterior_m <- as_draws_df(Pitch_m_posterior)
+
+# Intercept
+Intercept_Pitch <- ggplot(posterior_m) +
+  geom_density(aes(prior_Intercept), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  xlab('Intercept all studies') +
+  theme_classic()
+
+# Standard deviation
+Sd_Pitch <- ggplot(posterior_m) +
+  geom_density(aes(prior_sd_Study), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(sd_Study__Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  xlab('SD all studies') +
+  theme_classic()
+
+# Prior-posterior update check for published studies
+variables(Pitch_Published_m_posterior)
+published_posterior_m <- as_draws_df(Pitch_Published_m_posterior)
+
+# Intercept
+Intercept_Pitch_Published <- ggplot(published_posterior_m) +
+  geom_density(aes(prior_Intercept), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  xlab('Intercept published studies') +
+  theme_classic()
+
+# Standard deviation
+Sd_Pitch_Published <- ggplot(published_posterior_m) +
+  geom_density(aes(prior_sd_Study), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(sd_Study__Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  xlab('SD published studies') +
+  theme_classic()
+
+grid.arrange(Intercept_Pitch,Intercept_Pitch_Published, Sd_Pitch, Sd_Pitch_Published, nrow = 2,
+             top = textGrob('Prior-posterior update checks', gp = gpar(fontsize = 20)))
+
+```
+
+    Intercept all studies: The posterior distribution is very confident compared to the quite flat prior. It indicates that the posterior has learned from the data. The prior is broad but we don't want the prior to influence the posterior too much. We want the model to learn from the data. The posterior is a bit skewed to the right and therefore telling us that we should expect more positive outcome values in that range.  
+
+    Intercept published studies: The posterior is even more skewed to the right than the posterior for all studies. It is still very confident. The mean centered around 0.6 which is a little higher than for all studies. 
+
+    SD all studies: The posterior is more confident compared to the posterior distribution in published studies only. 
+
+    SD published studies: The posterior a bit broader. 
+
+## Question 2
+
+2.  What is the current evidence for distinctive vocal patterns in schizophrenia? Use the data from Parola et al (2020) - <https://www.dropbox.com/s/0l9ur0gaabr80a8/Matrix_MetaAnalysis_Diagnosis_updated290719.xlsx?dl=0> - focusing on pitch variability (PITCH_F0SD). Describe the data available (studies, participants). Using the model from question 1 analyze the data, visualize and report the findings: population level effect size; how well studies reflect it; influential studies, publication bias.
+
+```{r Load in the empirical data}
+df <- readxl::read_excel("Matrix_MetaAnalysis_Diagnosis.xlsx")
+```
+
+```{r Data preparation}
+glimpse(df)
+
+# Create subset of data frame 
+df_sub <- df %>% 
+  select(ArticleID, StudyID, Title, Article, Year_publication, DIAGNOSIS, SAMPLE_SIZE_SZ, SAMPLE_SIZE_HC,PITCH_F0SD_HC_M, PITCH_F0SD_HC_SD, PITCH_F0SD_SZ_M, PITCH_F0SD_SZ_SD)
+
+# Calculate the study effects and the standard deviations to make them compatible with the bayesian formula model
+df_analysis <- escalc('SMD', # standardized mean differences 
+                     n1i = SAMPLE_SIZE_HC, n2i = SAMPLE_SIZE_SZ, # sample size
+                     m1i = PITCH_F0SD_HC_M, m2i = PITCH_F0SD_SZ_M, # mean
+                     sd1i = PITCH_F0SD_HC_SD, sd2i = PITCH_F0SD_SZ_SD, # standard deviation 
+                     data = df_sub) # data 
+
+# Rename column names
+df_analysis <- df_analysis %>% 
+  rename(TrueStudyEffect = yi,
+         ObservedSigma = vi,
+         Study = StudyID)
+
+```
+
+```{r Posterior predictive check}
+# Posterior predictive check for empirical data 
+df_model <- brm(
+  Pitch_f,
+  data = df_analysis, 
+  family = "normal",
+  prior = Pitch_p,
+  sample_prior = T,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(df_model, ndraws = 100) +
+  labs(title = "Posterior update check with empirical data")
+
+```
+
+```{r Population effect size}
+print(df_model)
+```
+
+
