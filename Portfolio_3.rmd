@@ -1,0 +1,1332 @@
+---
+title: "Assignment 3"
+output: html_document
+date: "2022-11-02"
+---
+## Load packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+pacman::p_load(tidyverse,
+               tidybayes,
+               tidymodels,
+               ggplot2,
+               bayesplot,
+               brms,
+               tibble,
+               rstan,
+               msm,
+               readxl,
+               gridExtra,
+               grid,
+               dplyr,
+               tidytext)
+```
+
+# Part 1: Simulating data
+```{r}
+set.seed(1000)
+
+# Define parameters
+## Informed setup 
+pitch <- 0.25 #v1
+pitch_variability <- -0.55 #v2
+speech_rate <- -0.75 #v3
+pro_of_spoken_time <- -1.26 #v4
+pause_number <- 0.05 #v5
+pause_length <- 1.89 #v6
+
+# Simulate for 100 pairs
+n <- 100
+trials <- 10
+
+## Define different effect sizes (6 effect sizes from the simulation, 4 random noise)
+InformedEffectMean <- c(0.25, -0.55, -0.75, -1.26, 0.05, 1.89, 0, 0, 0, 0)
+SkepticalEffectMean <- rep(0, 10)
+
+# Define variability and error
+Individual_SD <- 1 #individual variability
+Trial_SD <- 0.5 #the average variation between trials 
+Error <- 0.2 #measurement error
+
+# Identify the true effect size for each variable
+for (i in seq(10)) {
+  temp_informed <- tibble(
+    ID = seq(n),
+    TrueEffect = rnorm(n, InformedEffectMean[i], Individual_SD),
+    Variable = paste0("v",i))
+  temp_skeptic <- tibble(
+    ID = seq(n),
+    TrueEffect = rnorm(n, SkepticalEffectMean[i],Individual_SD),
+    Variable = paste0("v",i))
+  if (i == 1) {
+    d_informed_true <- temp_informed
+    d_skeptic_true <- temp_skeptic
+  } else {
+    d_informed_true <- rbind(d_informed_true, temp_informed)
+    d_skeptic_true <- rbind(d_skeptic_true, temp_skeptic)
+  }
+}
+
+# Create tibble with one row per trial
+d_trial <- tibble(expand_grid(ID = seq(n), Trial = seq(trials), Group = c("Schizophrenia", "Control")))
+
+d_informed <- merge(d_informed_true,d_trial)
+d_skeptic <- merge(d_skeptic_true,d_trial)
+
+# Deviation
+for (i in seq(nrow(d_informed))) {
+  d_informed$deviation[i] <- ifelse(d_informed$Group[i] == "Schizophrenia", #measurement denotes the difference between groups
+                              rnorm(1, rnorm(1,d_informed$TrueEffect[i]/2,Trial_SD), Error), # schizophrenia 
+                              rnorm(1, rnorm(1,(-d_informed$TrueEffect[i])/2,Trial_SD), Error)) # control
+  d_skeptic$deviation[i] <- ifelse(d_skeptic$Group[i] == "Schizophrenia",
+                              rnorm(1, rnorm(1,d_skeptic$TrueEffect[i]/2,Trial_SD), Error), # schizophrenia
+                              rnorm(1, rnorm(1,(-d_skeptic$TrueEffect[i])/2,Trial_SD), Error)) # control
+}
+
+# Make the data frame wider 
+d_informed <- d_informed %>% mutate(TrueEffect = NULL) %>% pivot_wider(names_from = Variable, values_from = deviation)
+d_skeptic <- d_skeptic %>% mutate(TrueEffect = NULL) %>% pivot_wider(names_from = Variable, values_from = deviation)
+
+# Rename variables
+d_informed <- d_informed %>% 
+  rename(pitch = v1,
+         pitch_variability = v2,
+         speech_rate = v3,
+         proportion_of_spoken_time = v4,
+         pause_number = v5,
+         pause_length = v6,
+         noise_1 = v7,
+         noise_2 = v8,
+         noise_3 = v9,
+         noise_4 = v10) 
+
+d_skeptic <- d_skeptic %>% 
+  rename(noise_1 = v1,
+         noise_2 = v2,
+         noise_3 = v3,
+         noise_4 = v4,
+         noise_5 = v5,
+         noise_6 = v6,
+         noise_7 = v7,
+         noise_8 = v8,
+         noise_9 = v9,
+         noise_10 = v10)
+
+```
+
+```{r Creating train and test set}
+## Data budget (80/20 split): 
+TestID <- sample(seq(n), 20) #sample of 20 pairs so that we can have the 80/20 split
+
+# Create train and test set for informed
+train_informed <- d_informed %>% subset(!(ID %in% TestID)) #train_informed is a subset of d_informed which does not contain any of the ID's that are currently in the TestID sample
+test_informed <- d_informed %>% subset(ID %in% TestID) #test_informed is a subset of d_informed that only contain ID's that are in the TestID sample
+
+# Create train and test set for skeptic 
+train_skeptic <- d_skeptic %>% subset(!(ID %in% TestID)) #train_skeptic is a subset of d_skeptic which does not contain any of the ID's that are currently in the TestID sample
+test_skeptic <- d_skeptic %>% subset(ID %in% TestID) #test_skeptic is a subset of d_skeptic that only contain ID's that are in the TestID sample
+
+```
+
+```{r Scale the data}
+## Transform ID and trial into factor
+train_informed$ID <- as.factor(train_informed$ID)
+train_informed$Trial <- as.factor(train_informed$Trial)
+test_informed$ID <- as.factor(test_informed$ID)
+test_informed$Trial <- as.factor(test_informed$Trial)
+
+train_skeptic$ID <- as.factor(train_skeptic$ID)
+train_skeptic$Trial <- as.factor(train_skeptic$Trial)
+test_skeptic$ID <- as.factor(test_skeptic$ID)
+test_skeptic$Trial <- as.factor(test_skeptic$Trial)
+ 
+## Create recipe for scaling the data using tidymodels
+rec_informed <- train_informed %>%
+  recipe(Group ~ . ) %>% # defines the outcome        
+  step_scale(all_numeric() ) %>% # scales numeric predictors
+  step_center(all_numeric() ) %>% # center numeric predictors
+  prep(training = train_informed, retain = TRUE)
+
+rec_skeptic <- train_skeptic %>%
+  recipe(Group ~ . ) %>% # defines the outcome        
+  step_scale(all_numeric() ) %>% # scales numeric predictors
+  step_center(all_numeric() ) %>% # center numeric predictors
+  prep(training = train_skeptic, retain = TRUE)
+
+## Apply recipe to train and test to scale the data 
+train_informed_s <- juice(rec_informed)
+test_informed_s <- bake(rec_informed, new_data = test_informed, all_predictors()) %>% 
+  mutate(Group = test_informed$Group,
+         ID = test_informed$ID)
+train_skeptic_s <- juice(rec_skeptic)
+test_skeptic_s <- bake(rec_skeptic, new_data = test_skeptic, all_predictors()) %>% 
+  mutate(Group = test_skeptic$Group,
+         ID = test_skeptic$ID)
+```
+
+```{r Define model and get priors}
+# Informed 
+diag_info_f <- bf(Group ~ 1 + pitch + pitch_variability + speech_rate + proportion_of_spoken_time + pause_number + pause_length + noise_1 + noise_2  + noise_3 + noise_4 + (1+Trial|ID))
+
+get_prior(diag_info_f, train_informed_s, family = bernoulli)
+
+# Skeptic
+diag_skeptic_f <- bf(Group ~ 1 + noise_1 + noise_2 + noise_3 + noise_3 + noise_4 + noise_5 + noise_6 + noise_7  + noise_8 + noise_9 + noise_10 + (1+Trial|ID))
+
+get_prior(diag_skeptic_f, train_skeptic_s, family = bernoulli)
+
+```
+
+```{r Set priors}
+# Informed
+diag_info_p <- c(
+  prior(normal(0,1), class = Intercept),
+  prior(normal(0,0.6), class = b))
+
+# Skeptic
+diag_skeptic_p <- c(
+  prior(normal(0,1), class = Intercept),
+  prior(normal(0,0.6), class = b)
+)
+
+```
+
+```{r Prior predictive chekcs}
+# Informed
+diag_info_prior <- brm(
+  diag_info_f,
+  data = train_informed_s, 
+  family = "bernoulli",
+  prior = diag_info_p,
+  sample_prior = "only",
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(diag_info_prior, ndraws = 100) +
+  labs(title = "Prior-predictive check informed")
+
+# Skeptic 
+diag_skeptic_prior <- brm(
+  diag_skeptic_f,
+  data = train_skeptic_s, 
+  family = "bernoulli",
+  prior = diag_skeptic_p,
+  sample_prior = "only",
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(diag_skeptic_prior, ndraws = 100) +
+  labs(title = "Prior-predictive check skeptic")
+
+
+```
+
+```{r Posterior update checks}
+# Informed
+diag_info_posterior <- brm(
+  diag_info_f,
+  data = train_informed_s, 
+  family = "bernoulli",
+  prior = diag_info_p,
+  sample_prior = TRUE,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(diag_info_posterior, ndraws = 100) +
+  labs(title = "Posterior-predictive check informed")
+
+# Skeptic 
+diag_skeptic_posterior <- brm(
+  diag_skeptic_f,
+  data = train_skeptic_s, 
+  family = "bernoulli",
+  prior = diag_skeptic_p,
+  sample_prior = TRUE,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(diag_skeptic_posterior, ndraws = 100) +
+  labs(title = "Posterior-predictive check skeptic")
+
+```
+```{r Prior-posterior update checks}
+## INTERCEPT
+# Informed intercept
+variables(diag_info_posterior)
+posterior_info_m <- as_draws_df(diag_info_posterior)
+
+info_intercept <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_Intercept), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Informed")
+
+# Skeptic intercept
+variables(diag_skeptic_posterior)
+posterior_skeptic_m <- as_draws_df(diag_skeptic_posterior)
+
+skeptic_intercept <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_Intercept), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() + 
+  labs(title = "Skeptic")
+
+grid.arrange(info_intercept, skeptic_intercept,
+             top = textGrob('Prior-posterior update checks for the intercept', gp = gpar(fontsize  = 20)))
+
+# BETAS 
+# Informed betas
+info_1 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_pitch), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Pitch")
+
+info_2 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_pitch_variability), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Pitch variability")
+
+info_3 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_speech_rate), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Speech rate")
+
+info_4 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_proportion_of_spoken_time), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Proportion of spoken time")
+
+info_5 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_pause_number), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Pause number")
+
+info_6 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_pause_length), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Pause length")
+
+info_7 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_1), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 1")
+
+info_8 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_2), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 2")
+
+info_9 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_3), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 3")
+
+info_10 <- ggplot(posterior_info_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_4), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 4")
+
+grid.arrange(info_1, info_2, info_3, info_4, info_5, info_6, info_7, info_8, info_9, info_10, nrow = 2,
+             top = textGrob('Prior-posterior update checks for the betas of the informed model', gp = gpar(fontsize  = 20)))
+# Skeptic betas
+skeptic_1 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_1), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 1")
+
+skeptic_2 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_2), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 2")
+
+skeptic_3 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_3), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 3")
+
+skeptic_4 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_4), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 4")
+
+skeptic_5 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_5), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 5")
+
+skeptic_6 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_6), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 6")
+
+skeptic_7 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_7), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise_7")
+
+skeptic_8 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_8), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 8")
+
+skeptic_9 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_9), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 9")
+
+skeptic_10 <- ggplot(posterior_skeptic_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_10), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 10")
+
+grid.arrange(skeptic_1, skeptic_2, skeptic_3, skeptic_4, skeptic_5, skeptic_6, skeptic_7, skeptic_8, skeptic_9, skeptic_10, nrow = 2,
+             top = textGrob('Prior-posterior update checks for betas of the skeptic model', gp = gpar(fontsize  = 20)))
+```
+
+```{r Performance on the test set}
+### TEST PERFORMANCE
+## Posterior-predictive checks informed test data
+test_info_posterior <- brm(
+  diag_info_f,
+  data = test_informed_s, 
+  family = "bernoulli",
+  prior = diag_info_p,
+  sample_prior = T,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(test_info_posterior, ndraws = 100) +
+  labs(title = "Posterior-predictive check for test informed data")
+
+## Posterior-predictive checks skeptic test data 
+test_skeptic_posterior <- brm(
+  diag_skeptic_f,
+  data = test_skeptic_s, 
+  family = "bernoulli",
+  prior = diag_skeptic_p,
+  sample_prior = T,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(test_skeptic_posterior, ndraws = 100) +
+  labs(title = "Posterior-predictive check for test skeptic data")
+```
+
+```{r}
+## PRIOR POSTERIOR UPDATE CHECKS WITH THE TEST
+## INTERCEPT
+# Informed intercept
+variables(test_info_posterior)
+posterior_info_test_m <- as_draws_df(test_info_posterior)
+
+info_test_intercept <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_Intercept), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Test informed")
+
+# Skeptic intercept
+variables(test_skeptic_posterior)
+posterior_skeptic_test_m <- as_draws_df(test_skeptic_posterior)
+
+skeptic_test_intercept <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_Intercept), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() + 
+  labs(title = "Test skeptic")
+
+grid.arrange(info_test_intercept, skeptic_test_intercept,
+             top = textGrob('Prior-posterior update checks for the test intercept', gp = gpar(fontsize  = 20)))
+
+# BETAS 
+# Informed betass
+test_info_1 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_pitch), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Pitch")
+
+test_info_2 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_pitch_variability), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Pitch variability")
+
+test_info_3 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_speech_rate), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Speech rate")
+
+test_info_4 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_proportion_of_spoken_time), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Proportion of spoken time")
+
+test_info_5 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_pause_number), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Pause number")
+
+test_info_6 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_pause_length), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Pause length")
+
+test_info_7 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_1), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 1")
+
+test_info_8 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_2), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 2")
+
+test_info_9 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_3), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 3")
+
+test_info_10 <- ggplot(posterior_info_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_4), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 4")
+
+grid.arrange(test_info_1, test_info_2, test_info_3, test_info_4, test_info_5, test_info_6, test_info_7, test_info_8, test_info_9, test_info_10, nrow = 2,
+             top = textGrob('Prior-posterior update checks for the betas of the informed test model', gp = gpar(fontsize  = 20)))
+
+# Skeptic betas
+test_skeptic_1 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_1), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 1")
+
+test_skeptic_2 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_2), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 2")
+
+test_skeptic_3 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_3), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 3")
+
+test_skeptic_4 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_4), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 4")
+
+test_skeptic_5 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_5), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 5")
+
+test_skeptic_6 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_6), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 6")
+
+test_skeptic_7 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_7), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise_7")
+
+test_skeptic_8 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_8), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 8")
+
+test_skeptic_9 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_9), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 9")
+
+test_skeptic_10 <- ggplot(posterior_skeptic_test_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_noise_10), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Noise 10")
+
+grid.arrange(test_skeptic_1, test_skeptic_2, test_skeptic_3, test_skeptic_4, test_skeptic_5, test_skeptic_6, test_skeptic_7, test_skeptic_8, test_skeptic_9, test_skeptic_10, nrow = 2,
+             top = textGrob('Prior-posterior update checks for betas of the skeptic test model', gp = gpar(fontsize  = 20)))
+```
+
+```{r Assesing model performance}
+## Generating average predictions
+## Informed
+train_informed_s$PredictionsPerc0 <- predict(diag_info_posterior)[, 1]
+train_informed_s$prediction0[train_informed_s$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+train_informed_s$prediction0[train_informed_s$PredictionsPerc0 <= 0.5] <- "Control"
+
+train_informed_s <- train_informed_s %>% 
+  mutate(
+    Group = as.factor(Group),
+    prediction0 = as.factor(prediction0)
+  )
+
+test_informed_s$PredictionsPerc0 <- predict(diag_info_posterior, newdata = test_informed_s, allow_new_levels = TRUE)[, 1]
+test_informed_s$prediction0[test_informed_s$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+test_informed_s$prediction0[test_informed_s$PredictionsPerc0 <= 0.5] <- "Control"
+
+test_informed_s <- test_informed_s %>% 
+  mutate(
+    Group = as.factor(Group),
+    prediction0 = as.factor(prediction0)
+  )
+
+## Skeptic
+train_skeptic_s$PredictionsPerc0 <- predict(diag_skeptic_posterior)[, 1]
+train_skeptic_s$prediction0[train_skeptic_s$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+train_skeptic_s$prediction0[train_skeptic_s$PredictionsPerc0 <= 0.5] <- "Control"
+
+train_skeptic_s <- train_skeptic_s %>% 
+  mutate(
+    Group = as.factor(Group),
+    prediction0 = as.factor(prediction0)
+  )
+
+test_skeptic_s$PredictionsPerc0 <- predict(diag_skeptic_posterior, newdata = test_skeptic_s, allow_new_levels = TRUE)[, 1]
+test_skeptic_s$prediction0[test_skeptic_s$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+test_skeptic_s$prediction0[test_skeptic_s$PredictionsPerc0 <= 0.5] <- "Control"
+
+test_skeptic_s <- test_skeptic_s %>% 
+  mutate(
+    Group = as.factor(Group),
+    prediction0 = as.factor(prediction0)
+  )
+
+## Assessing average performance with confusion matrices and kappa/accuracy
+## Informed
+conf_mat(
+  train_informed_s,
+  truth = Group,
+  estimate = prediction0,
+  dnn = c("Prediction", "Truth")
+)
+
+conf_mat(
+  test_informed_s,
+  truth = Group,
+  estimate = prediction0,
+  dnn = c("Prediction", "Truth")
+)
+
+metrics(train_informed_s,
+        truth = Group, estimate = prediction0) %>% 
+  knitr::kable()
+
+metrics(test_informed_s,
+        truth = Group, estimate = prediction0) %>% 
+  knitr::kable()
+
+## Skeptic
+conf_mat(
+  train_skeptic_s,
+  truth = Group,
+  estimate = prediction0,
+  dnn = c("Prediction", "Truth")
+)
+
+conf_mat(
+  test_skeptic_s,
+  truth = Group,
+  estimate = prediction0,
+  dnn = c("Prediction", "Truth")
+)
+
+metrics(train_skeptic_s,
+        truth = Group, estimate = prediction0) %>% 
+  knitr::kable()
+
+metrics(test_skeptic_s,
+        truth = Group, estimate = prediction0) %>% 
+  knitr::kable()
+
+```
+
+
+```{r Assessing uncertainty for informed}
+## Getting an uncertainty plot (for the informed only, both training and test)
+Performance_Prob_Informed <- tibble(expand_grid(
+  sample = seq(2000),
+  model = "diag_info_f",
+  setup = "informed",
+  type = c("training", "test"),
+  Accuracy = NA)
+)
+
+train0 <- inv_logit_scaled(posterior_linpred(diag_info_posterior, summary = F))
+test0 <- inv_logit_scaled(posterior_linpred(diag_info_posterior, summary = F,
+                                            newdata = test_informed_s, allow_new_levels = T))
+
+for(i in seq(2000)) {
+  train_informed_s$prediction_train <- as.factor(ifelse(train0[i,] > 0.5,"Schizophrenia", "Control"))
+  test_informed_s$prediction_test <- as.factor(ifelse(test0[i,] > 0.5,"Schizophrenia", "Control"))
+  
+  Performance_Prob_Informed$Accuracy[Performance_Prob_Informed$sample == i & Performance_Prob_Informed$model == "diag_info_f" & Performance_Prob_Informed$setup == "informed" & Performance_Prob_Informed$type == "training"] <- accuracy(train_informed_s, truth = Group, estimate = prediction_train)[, ".estimate"]
+  
+  Performance_Prob_Informed$Accuracy[Performance_Prob_Informed$sample == i & Performance_Prob_Informed$model == "diag_info_f" & Performance_Prob_Informed$setup == "informed" & Performance_Prob_Informed$type == "test"] <- accuracy(test_informed_s, truth = Group, estimate = prediction_test)[, ".estimate"]
+}
+
+## Plotting uncertainty
+uncertainty_informed <- ggplot(Performance_Prob_Informed, aes(x = type, y = as.numeric(Accuracy))) +
+  geom_point(aes(color = type, size = 3)) + 
+  ggtitle("Uncertainty plot for the informed model")
+```
+
+```{r Assessing uncertainty for skeptic}
+## Getting an uncertainty plot (for the skeptic only, both training and test)
+Performance_Prob_Skeptic <- tibble(expand_grid(
+  sample = seq(2000),
+  model = "diag_skeptic_f",
+  setup = "skeptic",
+  type = c("training", "test"),
+  Accuracy = NA)
+)
+
+train0_skeptic <- inv_logit_scaled(posterior_linpred(diag_skeptic_posterior, summary = F))
+test0_skeptic <- inv_logit_scaled(posterior_linpred(diag_skeptic_posterior, summary = F,
+                                            newdata = test_skeptic_s, allow_new_levels = T))
+
+for(i in seq(2000)) {
+  train_skeptic_s$prediction_train <- as.factor(ifelse(train0_skeptic[i,] > 0.5,"Schizophrenia", "Control"))
+  test_skeptic_s$prediction_test <- as.factor(ifelse(test0_skeptic[i,] > 0.5,"Schizophrenia", "Control"))
+  
+  Performance_Prob_Skeptic$Accuracy[Performance_Prob_Skeptic$sample == i & Performance_Prob_Skeptic$model == "diag_skeptic_f" & Performance_Prob_Skeptic$setup == "skeptic" & Performance_Prob_Skeptic$type == "training"] <- accuracy(train_skeptic_s, truth = Group, estimate = prediction_train)[, ".estimate"]
+  
+  Performance_Prob_Skeptic$Accuracy[Performance_Prob_Skeptic$sample == i & Performance_Prob_Skeptic$model == "diag_skeptic_f" & Performance_Prob_Skeptic$setup == "skeptic" & Performance_Prob_Skeptic$type == "test"] <- accuracy(test_skeptic_s, truth = Group, estimate = prediction_test)[, ".estimate"]
+}
+
+## Plotting uncertainty
+uncertainty_skeptic <- ggplot(Performance_Prob_Skeptic, aes(x = type, y = as.numeric(Accuracy))) +
+  geom_point(aes(color = type, size = 3)) + 
+  ggtitle("Uncertainty plot for the skeptic model")
+
+## Plots for both informed and skeptic
+grid.arrange(uncertainty_informed, uncertainty_skeptic, nrow = 1)
+```
+
+```{r Feature importance}
+## Informed
+## obs. numbers on standard deviation scale
+Coefficients <- summary(diag_info_posterior)$fixed
+Beta_values <- abs(Coefficients)
+
+Beta_values <- Beta_values %>% 
+  select(Estimate)
+
+## First time
+Beta_values <- Beta_values %>% 
+  mutate(weight = (Estimate/sum(Estimate))) 
+
+## Removing values under the threshold of .10
+Beta_values_2 <- Beta_values %>% 
+  filter(weight > .10)
+
+## Second time
+Beta_values_2 <- Beta_values_2 %>% 
+  mutate(weight = (Estimate/sum(Estimate)))
+
+### There are no values below .10, so these are the final ones for the informed!
+
+## Skeptic
+Coefficients_skeptic <- summary(diag_skeptic_posterior)$fixed
+Beta_values_skeptic <- abs(Coefficients_skeptic)
+
+Beta_values_skeptic <- Beta_values_skeptic %>% 
+  select(Estimate)
+
+## First time
+Beta_values_skeptic <- Beta_values_skeptic %>% 
+  mutate(weight = (Estimate/sum(Estimate))) 
+
+## Removing under the threshold of .10
+Beta_values_skeptic_2 <- Beta_values_skeptic %>% 
+  filter(weight > .10)
+
+## Second time
+Beta_values_skeptic_2 <- Beta_values_skeptic_2 %>% 
+  mutate(weight = (Estimate/sum(Estimate)))
+
+### There are no values below .10, so these are the final ones for the skeptic!
+```
+
+PART 3 - Empirical data 
+```{r Load data}
+empirical_data <- read_csv("Data.csv")
+```
+
+```{r Data preprocessing}
+n_diagnoses <- empirical_data %>% 
+  group_by(PatID) %>% 
+  summarize(unique(Diagnosis)) %>% 
+  group_by(PatID) %>% 
+  summarize(n=n()) %>% 
+  filter(n == 1) %>% 
+  .$PatID
+
+empirical_data <- empirical_data %>% 
+  filter(!PatID %in% n_diagnoses)
+
+unique(empirical_data$PatID)
+
+empirical_data$Diagnosis <- as.factor(empirical_data$Diagnosis)
+levels(empirical_data$Diagnosis) <- c("Control", "Schizophrenia")
+levels(empirical_data$Diagnosis)
+```
+
+```{r Creating train and test set}
+## Data budget (80/20 split): 
+TestID_Empirical <- sample(unique(empirical_data$PatID), length(unique(empirical_data$PatID)) * 0.2) #a sample of 20 pairs so that we can have the 80/20 split
+
+## Create train and test set for empirical data 
+train_empirical <- empirical_data %>% subset(!(PatID %in% TestID_Empirical)) #train_informed is a subset of empirical_data which does not contain any of the ID's that are currently in the TestID_Empirical sample
+test_empirical <- empirical_data %>% subset(PatID %in% TestID_Empirical) #test_informed is a subset of empirical_data that only contains ID's that are in the TestID_Empirical sample.
+
+```
+
+```{r Transforming and scaling empirical data}
+## Transform variables
+train_empirical$PatID <- as.factor(train_empirical$PatID)
+train_empirical$NewID <- as.factor(train_empirical$NewID)
+train_empirical$Corpus <- as.factor(train_empirical$Corpus)
+test_empirical$PatID <- as.factor(test_empirical$PatID)
+test_empirical$NewID <- as.factor(test_empirical$NewID)
+test_empirical$Corpus <- as.factor(test_empirical$Corpus)
+
+## Create recipe for scaling the data using tidymodels
+rec_empirical <- train_empirical %>%
+  recipe(Diagnosis ~ . ) %>% # defines the outcome        
+  step_scale(all_numeric() ) %>% # scales numeric predictors
+  step_center(all_numeric() ) %>% # center numeric predictors
+  prep(training = train_empirical, retain = TRUE)
+
+## Apply recipe to train and test to scale the data 
+train_empirical_s <- juice(rec_empirical)
+test_empirical_s <- bake(rec_empirical, new_data = test_empirical, all_predictors()) %>% 
+  mutate(PatID = test_empirical$PatID,
+         NewID = test_empirical$NewID,
+         Diagnosis = test_empirical$Diagnosis)
+
+test_empirical_s <- test_empirical_s %>% 
+  relocate(Diagnosis, .after = NewID)
+```
+
+```{r Principal component analysis}
+# Remove variables that are not relevant
+train_empirical_s <- train_empirical_s %>% 
+  select(-Language, -Corpus)
+
+## Transforming variables
+train_empirical_s$PatID <-  as.character(train_empirical_s$PatID)
+train_empirical_s$NewID <- as.character(train_empirical_s$NewID) 
+train_empirical_s$Gender <-  as.character(train_empirical_s$Gender) 
+train_empirical_s$Trial <-  as.character(train_empirical_s$Trial)
+
+# Creating recipe for PCA
+pca_rec <- recipe(~., data = train_empirical_s) %>% 
+  update_role(PatID, NewID, Gender, Trial, new_role = "id") %>%
+  step_pca(all_numeric())
+
+# Prepping PCA
+pca_prep <- prep(pca_rec) #Actual PCA
+
+# Tidying PCA
+tidied_pca <- tidy(pca_prep,1) #Making it prettier
+
+# Visualization of PCA results
+tidied_pca %>%  
+  filter(component %in% paste0("PC", 1:5)) %>%  #why 5?
+  mutate(component = fct_inorder(component)) %>%
+  ggplot(aes(value, terms, fill = terms)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~component, nrow = 1) +
+  labs(y = NULL)
+
+# Finding the most important values
+tidied_pca %>%
+  filter(component %in% paste0("PC", 1:5)) %>%
+  group_by(component) %>%
+  top_n(12, abs(value)) %>%
+  ungroup() %>%
+  mutate(terms = reorder_within(terms, abs(value), component)) %>%
+  ggplot(aes(abs(value), terms, fill = value > 0)) +
+  geom_col() +
+  facet_wrap(~component, scales = "free_y") +
+  scale_y_reordered() +
+  labs(
+    x = "Absolute value of contribution",
+    y = NULL, fill = "Positive?"
+  )
+
+# Create data frame
+juiced_pca <- juice(pca_prep)
+
+```
+
+```{r Define Bayesian formula and get priors}
+empirical_f <- bf(Diagnosis ~ 1 + PC1 + PC2 + PC3 + PC4 + PC5 + (1 + Trial|PatID))
+
+get_prior(empirical_f, juiced_pca, family = bernoulli)
+```
+
+```{r Setting priors}
+empirical_p <- c(
+  prior(normal(0,1), class = Intercept),
+  prior(normal(0,0.6), class = b)
+)
+```
+
+```{r Prior-predictive check}
+empirical_prior <- brm(
+  empirical_f,
+  data = juiced_pca, 
+  family = "bernoulli",
+  prior = empirical_p,
+  sample_prior = "only",
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(empirical_prior, ndraws = 100)+
+  labs(title = "prior-predictive check")
+```
+
+```{r Posterior-predictive checks}
+empirical_posterior <- brm(
+  empirical_f,
+  data = juiced_pca, 
+  family = "bernoulli",
+  prior = empirical_p,
+  sample_prior = TRUE,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(empirical_posterior, ndraws = 100) + 
+  labs(title = "posterior-predicitive checks")
+```
+
+```{r Prior-posterior update checks}
+variables(empirical_posterior)
+posterior_m <- as_draws_df(empirical_posterior)
+
+## Intercept
+intercept <- ggplot(posterior_m) +
+  geom_density(aes(prior_Intercept), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Intercept")
+
+PC1 <- ggplot(posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC1), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "PC1")
+
+# Betas 
+PC2 <- ggplot(posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC2), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "PC2")
+
+PC3 <- ggplot(posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC3), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "PC3")
+
+PC4 <- ggplot(posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC4), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "PC4")
+
+PC5 <- ggplot(posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC5), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "PC5")
+
+grid.arrange(intercept, PC1, PC2, PC3, PC4, PC5, nrow = 2,
+             top = textGrob("Prior-posterior update checks", gp = gpar(fontsize = 20)))
+```
+
+```{r Performance on the test set}
+## We start out by making the test-dataset like the training-dataset
+## Remove variables that are not relevant
+test_empirical_s <- test_empirical_s %>% 
+  select(-Language, -Corpus)
+
+## Transforming variables
+test_empirical_s$PatID <-  as.character(test_empirical_s$PatID)
+test_empirical_s$NewID <- as.character(test_empirical_s$NewID) 
+test_empirical_s$Gender <-  as.character(test_empirical_s$Gender) 
+test_empirical_s$Trial <-  as.character(test_empirical_s$Trial)
+
+# Create recipe for PCA
+test_pca_rec <- recipe(~., data = test_empirical_s) %>% 
+  update_role(PatID, NewID, Gender, Trial, new_role = "id") %>%
+  step_pca(all_numeric())
+
+# Prep PCA
+test_pca_prep <- prep(test_pca_rec) #Actual PCA
+
+# Create data frame
+juiced_test_pca <- juice(test_pca_prep)
+
+```
+
+```{r Performance on the test set}
+## Posterior-predictive checks with test data
+empirical_test_posterior <- brm(
+  empirical_f,
+  data = juiced_test_pca, 
+  family = "bernoulli",
+  prior = empirical_p,
+  sample_prior = TRUE,
+  chains = 2, 
+  cores = 2,
+  backend = "cmdstanr",
+    threads = threading(2),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 20
+  )
+)
+
+pp_check(empirical_test_posterior, ndraws = 100) + 
+  labs(title = "posterior-predicitive checksfor test-dataset")
+```
+
+```{r Performance on the test set}
+## Prior-posterior update checks
+variables(empirical_test_posterior)
+test_posterior_m <- as_draws_df(empirical_test_posterior)
+
+## Intercept test set
+test_intercept <- ggplot(test_posterior_m) +
+  geom_density(aes(prior_Intercept), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_Intercept), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Test intercept")
+
+## Betas test set
+test_PC1 <- ggplot(test_posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC1), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Test PC1")
+
+test_PC2 <- ggplot(test_posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC2), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Test PC2")
+
+test_PC3 <- ggplot(test_posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC3), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Test PC3")
+
+test_PC4 <- ggplot(test_posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC4), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Test PC4")
+
+test_PC5 <- ggplot(test_posterior_m) +
+  geom_density(aes(prior_b), fill = "steelblue", 
+               color = "black", alpha = .6) +
+  geom_density(aes(b_PC5), fill = "red", 
+               color = "black", alpha = .6) +
+  theme_classic() +
+  labs(title = "Test PC5")
+
+grid.arrange(test_intercept, test_PC1, test_PC2, test_PC3, test_PC4, test_PC5, nrow = 2,
+             top = textGrob("Prior-posterior update checks for test-dataset", gp = gpar(fontsize = 20)))
+```
+
+```{r Assessing model performance}
+## Generating average predictions
+### for the training model
+juiced_pca$PredictionsPerc0 <- predict(empirical_posterior)[, 1]
+juiced_pca$prediction0[juiced_pca$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+juiced_pca$prediction0[juiced_pca$PredictionsPerc0 <= 0.5] <- "Control"
+
+juiced_pca <- juiced_pca %>% 
+  mutate(
+    Diagnosis = as.factor(Diagnosis),
+    prediction0 = as.factor(prediction0)
+  )
+
+### for the test model
+juiced_test_pca$PredictionsPerc0 <- predict(empirical_test_posterior)[, 1]
+juiced_test_pca$prediction0[juiced_test_pca$PredictionsPerc0 > 0.5] <- "Schizophrenia"
+juiced_test_pca$prediction0[juiced_test_pca$PredictionsPerc0 <= 0.5] <- "Control"
+
+juiced_test_pca <- juiced_test_pca %>% 
+  mutate(
+    Diagnosis = as.factor(Diagnosis),
+    prediction0 = as.factor(prediction0)
+  )
+
+## Assessing average performance for the 2 model with confusion matrices and kappa/accuracy
+### for the train dataset
+conf_mat(
+  juiced_pca,
+  truth = Diagnosis,
+  estimate = prediction0,
+  dnn = c("Prediction", "Truth")
+)
+
+metrics(juiced_pca,
+        truth = Diagnosis, estimate = prediction0) %>% 
+  knitr::kable()
+
+### for the test dataset
+conf_mat(
+  juiced_test_pca,
+  truth = Diagnosis,
+  estimate = prediction0,
+  dnn = c("Prediction", "Truth")
+)
+
+metrics(juiced_test_pca,
+        truth = Diagnosis, estimate = prediction0) %>% 
+  knitr::kable()
+```
+
+
+```{r Assessing uncertainty}
+Performance_Prob_Empirical <- tibble(expand_grid(
+  sample = seq(2000),
+  model = "empirical_f",
+  setup = "Empirical data",
+  type = c("training", "test"),
+  Accuracy = NA)
+)
+
+## Now we need the levels with their old names, because time constraint
+empirical_train0 <- inv_logit_scaled(posterior_linpred(empirical_posterior, summary = F))
+empirical_test0 <- inv_logit_scaled(posterior_linpred(empirical_posterior, summary = F,
+                                            newdata = juiced_test_pca, allow_new_levels = T))
+
+for(i in seq(2000)) {
+  juiced_pca$prediction_train <- as.factor(ifelse(empirical_train0[i,] > 0.5,"Schizophrenia", "Control"))
+  juiced_test_pca$prediction_test <- as.factor(ifelse(empirical_test0[i,] > 0.5,"Schizophrenia", "Control"))
+  
+  Performance_Prob_Empirical$Accuracy[Performance_Prob_Empirical$sample == i & Performance_Prob_Empirical$model == "empirical_f" & Performance_Prob_Empirical$setup == "Empirical data" & Performance_Prob_Empirical$type == "training"] <- accuracy(juiced_pca, truth = Diagnosis, estimate = prediction_train)[, ".estimate"]
+  
+  Performance_Prob_Empirical$Accuracy[Performance_Prob_Empirical$sample == i & Performance_Prob_Empirical$model == "empirical_f" & Performance_Prob_Empirical$setup == "Empirical data" & Performance_Prob_Empirical$type == "test"] <- accuracy(juiced_test_pca, truth = Diagnosis, estimate = prediction_test)[, ".estimate"]
+}
+
+## Plotting 
+ggplot(Performance_Prob_Empirical, aes(x = type, y = as.numeric(Accuracy))) +
+  geom_point(aes(color = type, size = 3)) + 
+  ggtitle("Uncertainty plot for the empirical model")
+```
